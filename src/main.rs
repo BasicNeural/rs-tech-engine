@@ -7,6 +7,10 @@ mod cube;
 #[path = "./geometry/object.rs"]
 mod object;
 
+use glium::*;
+use rusttype::gpu_cache::Cache;
+use rusttype::{point, vector, Font, PositionedGlyph, Rect, Scale};
+use std::borrow::Cow;
 use object::Vertex;
 use object::Object;
 use std::collections::LinkedList;
@@ -15,6 +19,10 @@ use std::collections::LinkedList;
 fn main() {
     #[allow(unused_imports)]
     use glium::{glutin, Surface};
+
+    let font_data = std::include_bytes!("resources/Ubuntu-R.ttf");
+    let font = Font::try_from_bytes(font_data as &[u8]).expect("err");
+
 
     let event_loop = glutin::event_loop::EventLoop::new();
     let wb = glutin::window::WindowBuilder::new();
@@ -39,11 +47,37 @@ fn main() {
         [-5.0, 1.0, 0.0, 1.0f32]
     ];
 
+    teapot.model = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [5.0, 0.0, 5.0, 1.0f32]
+    ];
+
     let mut objects: LinkedList<Object> = LinkedList::new();
 
     objects.push_back(teapot);
     objects.push_back(cube);
     objects.push_back(sphere);
+
+    let scale = display.gl_window().window().scale_factor();
+
+    let (cache_width, cache_height) = ((512.0 * scale) as u32, (512.0 * scale) as u32);
+    let mut cache: Cache<'static> = Cache::builder()
+        .dimensions(cache_width, cache_height)
+        .build();
+
+    let cache_tex = glium::texture::Texture2d::with_format(
+        &display,
+        glium::texture::RawImage2d {
+            data: Cow::Owned(vec![128u8; cache_width as usize * cache_height as usize]),
+            width: cache_width,
+            height: cache_height,
+            format: glium::texture::ClientFormat::U8,
+        },
+        glium::texture::UncompressedFloatFormat::U8,
+        glium::texture::MipmapsOption::NoMipmap,
+    ).expect("err");
 
     let vertex_shader_src = r#"
         #version 150
@@ -137,6 +171,28 @@ fn main() {
     let mut lshift: bool = false;
     let mut space: bool = false;
 
+    let text_program = glium::Program::from_source(&display, "
+        #version 140
+        in vec2 position;
+        in vec2 tex_coords;
+        in vec4 colour;
+        out vec2 v_tex_coords;
+        out vec4 v_colour;
+        void main() {
+            gl_Position = vec4(position, 0.0, 1.0);
+            v_tex_coords = tex_coords;
+            v_colour = colour;
+        }
+        ", "
+        #version 140
+        uniform sampler2D tex;
+        in vec2 v_tex_coords;
+        in vec4 v_colour;
+        out vec4 f_colour;
+        void main() {
+            f_colour = v_colour * vec4(1.0, 1.0, 1.0, texture(tex, v_tex_coords).r);
+        }", None).unwrap();
+
     let program = glium::Program::from_source(&display, vertex_shader_src, fragment_shader_src,
                                               None).unwrap();
     let axis_program = glium::Program::from_source(&display, vertex_shader_axis, fragment_shader_axis,
@@ -144,7 +200,12 @@ fn main() {
     let bounding_box_program = glium::Program::from_source(&display, vertex_shader_axis, fragment_shader_bounding_box,
                                               None).unwrap();
 
+    let mut prev_frame_time = std::time::Instant::now();
+
     event_loop.run(move |event, _, control_flow| {
+        let cur_frame_time = std::time::Instant::now();
+        let frame_diff = cur_frame_time - prev_frame_time;
+        prev_frame_time = cur_frame_time;
         let next_frame_time = std::time::Instant::now() +
             std::time::Duration::from_nanos(16_666_667);
         *control_flow = glutin::event_loop::ControlFlow::WaitUntil(next_frame_time);
@@ -224,10 +285,10 @@ fn main() {
             c_angle -= rotate_speed;
         }
 
-        if up && a_angle < PI / 2.0 {
+        if up && a_angle < PI {
             a_angle += 0.02;
         }
-        if down && -a_angle < PI / 2.0 {
+        if down && -a_angle < PI {
             a_angle -= 0.02;
         }
 
@@ -238,7 +299,7 @@ fn main() {
             y += speed;
         }
 
-        let view = view_matrix(&[x, y, z], &[c_angle.sin(), a_angle.sin(), c_angle.cos()], &[0.0, 1.0, 0.0]);
+        let view = view_matrix(&[x, y, z], &[c_angle.sin(), a_angle, c_angle.cos()], &[0.0, 1.0, 0.0]);
 
         let perspective = {
             let (width, height) = target.get_dimensions();
@@ -258,6 +319,29 @@ fn main() {
             ]
         };
 
+        let frustum = mat_mul(&view, &perspective);
+
+        let frustums = [
+            [   // left
+                frustum[0][3] + frustum[0][0],
+                frustum[1][3] + frustum[1][0],
+                frustum[2][3] + frustum[2][0],
+                frustum[3][3] + frustum[3][0],
+            ], 
+            [   // right
+                frustum[0][3] - frustum[0][0],
+                frustum[1][3] - frustum[1][0],
+                frustum[2][3] - frustum[2][0],
+                frustum[3][3] - frustum[3][0],
+            ], 
+            [   // near
+                frustum[0][3] + frustum[0][2],
+                frustum[1][3] + frustum[1][2],
+                frustum[2][3] + frustum[2][2],
+                frustum[3][3] + frustum[3][2],
+            ]
+        ].to_vec();
+
         let light = [-2.0, 2.0, 2.0f32];
 
         let params = glium::DrawParameters {
@@ -270,12 +354,22 @@ fn main() {
             .. Default::default()
         };
 
+        let scale = display.gl_window().window().scale_factor();
+        let (width, _): (u32, _) = display
+            .gl_window()
+            .window()
+            .inner_size()
+            .into();
+        let scale = scale as f32;
+
         let axis_vertex_buffer = glium::VertexBuffer::new(&display, &axis).unwrap();
         let axis_indices = glium::index::NoIndices(glium::index::PrimitiveType::LinesList);
 
         target.draw(&axis_vertex_buffer, &axis_indices, &axis_program,
                     &uniform! { model: axis_model, view: view, perspective: perspective, u_light: light },
                     &params).unwrap();
+
+        let mut draw_count = 0;
 
         for object in objects.iter() {
             let positions = glium::VertexBuffer::new(&display, &object.vertices).unwrap();
@@ -285,13 +379,133 @@ fn main() {
             let bounding_box_positions = glium::VertexBuffer::new(&display, &object.bounding_box_vertices).unwrap();
             let bounding_box_indices = glium::IndexBuffer::new(&display, glium::index::PrimitiveType::LinesList,
                 &object.bounding_box_indices).unwrap();
-            target.draw((&positions, &normals), &indices, &program,
+
+            if is_draw(&frustums, &object) {
+                draw_count += 1;
+                target.draw((&positions, &normals), &indices, &program,
                     &uniform! { model: object.model, view: view, perspective: perspective, u_light: light },
                     &params).unwrap();
+            }
+            
             target.draw(&bounding_box_positions, &bounding_box_indices, &bounding_box_program,
                     &uniform! { model: object.model, view: view, perspective: perspective, u_light: light },
                     &params).unwrap();
         }
+
+        let fps = {
+            if frame_diff.as_millis() == 0 {
+                0
+            } else {
+                1000 / frame_diff.as_millis()
+            }
+        };
+
+        let text = format!("FPS: {}\r\nvisible: {}", fps, draw_count);
+
+        let glyphs = layout_paragraph(&font, Scale::uniform(24.0 * scale), width, &text);
+        for glyph in &glyphs {
+            cache.queue_glyph(0, glyph.clone());
+        }
+        cache.cache_queued(|rect, data| {
+            cache_tex.main_level().write(
+                glium::Rect {
+                    left: rect.min.x,
+                    bottom: rect.min.y,
+                    width: rect.width(),
+                    height: rect.height(),
+                },
+                glium::texture::RawImage2d {
+                    data: Cow::Borrowed(data),
+                    width: rect.width(),
+                    height: rect.height(),
+                    format: glium::texture::ClientFormat::U8,
+                },
+            );
+        }).unwrap();
+
+        let uniforms = uniform! {
+            tex: cache_tex.sampled().magnify_filter(glium::uniforms::MagnifySamplerFilter::Nearest)
+        };
+
+        let vertex_buffer = {
+            #[derive(Copy, Clone)]
+            struct Vertex {
+                position: [f32; 2],
+                tex_coords: [f32; 2],
+                colour: [f32; 4],
+            }
+
+            implement_vertex!(Vertex, position, tex_coords, colour);
+            let colour = [1.0, 1.0, 1.0, 1.0];
+            let (screen_width, screen_height) = {
+            let (w, h) = display.get_framebuffer_dimensions();
+                (w as f32, h as f32)
+            };
+            let origin = point(0.0, 0.0);
+            let vertices: Vec<Vertex> = glyphs
+                .iter()
+                .filter_map(|g| cache.rect_for(0, g).ok().flatten())
+                .flat_map(|(uv_rect, screen_rect)| {
+                    let gl_rect = Rect {
+                        min: origin
+                            + (vector(
+                            screen_rect.min.x as f32 / screen_width - 0.5,
+                                1.0 - screen_rect.min.y as f32 / screen_height - 0.5,
+                            )) * 2.0,
+                        max: origin
+                            + (vector(
+                                screen_rect.max.x as f32 / screen_width - 0.5,
+                                1.0 - screen_rect.max.y as f32 / screen_height - 0.5,
+                            )) * 2.0,
+                    };
+                    vec![
+                        Vertex {
+                            position: [gl_rect.min.x, gl_rect.max.y],
+                            tex_coords: [uv_rect.min.x, uv_rect.max.y],
+                            colour,
+                        },
+                        Vertex {
+                            position: [gl_rect.min.x, gl_rect.min.y],
+                            tex_coords: [uv_rect.min.x, uv_rect.min.y],
+                            colour,
+                        },
+                        Vertex {
+                            position: [gl_rect.max.x, gl_rect.min.y],
+                            tex_coords: [uv_rect.max.x, uv_rect.min.y],
+                            colour,
+                        },
+                        Vertex {
+                            position: [gl_rect.max.x, gl_rect.min.y],
+                            tex_coords: [uv_rect.max.x, uv_rect.min.y],
+                            colour,
+                        },
+                        Vertex {
+                            position: [gl_rect.max.x, gl_rect.max.y],
+                            tex_coords: [uv_rect.max.x, uv_rect.max.y],
+                            colour,
+                        },
+                        Vertex {
+                            position: [gl_rect.min.x, gl_rect.max.y],
+                            tex_coords: [uv_rect.min.x, uv_rect.max.y],
+                            colour,
+                        },
+                    ]
+                })
+                .collect();
+
+            glium::VertexBuffer::new(&display, &vertices).unwrap()
+        };
+
+        target.draw(
+            &vertex_buffer,
+            glium::index::NoIndices(glium::index::PrimitiveType::TrianglesList),
+            &text_program,
+            &uniforms,
+            &glium::DrawParameters {
+                blend: glium::Blend::alpha_blending(),
+                ..Default::default()
+            },
+        ).unwrap();
         target.finish().unwrap();
     });
 }
@@ -329,4 +543,91 @@ fn view_matrix(position: &[f32; 3], direction: &[f32; 3], up: &[f32; 3]) -> [[f3
         [s_norm[2], u[2], f[2], 0.0],
         [p[0], p[1], p[2], 1.0],
     ]
+}
+
+fn layout_paragraph<'a>(
+    font: &Font<'a>,
+    scale: Scale,
+    width: u32,
+    text: &str,
+) -> Vec<PositionedGlyph<'a>> {
+    let mut result = Vec::new();
+    let v_metrics = font.v_metrics(scale);
+    let advance_height = v_metrics.ascent - v_metrics.descent + v_metrics.line_gap;
+    let mut caret = point(0.0, v_metrics.ascent);
+    let mut last_glyph_id = None;
+    for c in text.chars() {
+        if c.is_control() {
+            match c {
+                '\r' => {
+                    caret = point(0.0, caret.y + advance_height);
+                }
+                '\n' => {}
+                _ => {}
+            }
+            continue;
+        }
+        let base_glyph = font.glyph(c);
+        if let Some(id) = last_glyph_id.take() {
+            caret.x += font.pair_kerning(scale, id, base_glyph.id());
+        }
+        last_glyph_id = Some(base_glyph.id());
+        let mut glyph = base_glyph.scaled(scale).positioned(caret);
+        if let Some(bb) = glyph.pixel_bounding_box() {
+            if bb.max.x > width as i32 {
+                caret = point(0.0, caret.y + advance_height);
+                glyph.set_position(caret);
+                last_glyph_id = None;
+            }
+        }
+        caret.x += glyph.unpositioned().h_metrics().advance_width;
+        result.push(glyph);
+    }
+    result
+}
+
+fn is_draw(equations: &Vec<[f32; 4]>, object: &Object) -> bool {
+    let mut drawable: bool;
+    for vertex in object.bounding_box_vertices.iter() {
+        drawable = true;
+        for equation in equations.iter() {
+            let v = transform_vec(&object.model, &vertex);
+                if equation[0] * v.position.0 + equation[1] * v.position.1 + equation[2] * v.position.2 + equation[3] < 0.0 {
+                    drawable = false;
+                    break;
+                }
+        }
+        if drawable {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn transform_vec(a: &[[f32; 4]; 4], x: &Vertex) -> Vertex {
+    Vertex { position: (
+        a[0][0] * x.position.0 + a[1][0] * x.position.1 + a[2][0] * x.position.2 + a[3][0],
+        a[0][1] * x.position.0 + a[1][1] * x.position.1 + a[2][1] * x.position.2 + a[3][1],
+        a[0][2] * x.position.0 + a[1][2] * x.position.1 + a[2][2] * x.position.2 + a[3][2]
+    ) }
+}
+
+
+fn mat_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut c: [[f32; 4]; 4] = [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ];
+
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                c[i][j] += a[i][k] * b[k][j];
+            }
+        }
+    }
+
+    c
 }
