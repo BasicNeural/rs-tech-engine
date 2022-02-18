@@ -9,3 +9,5 @@ edition = "2021"
 glium = "0.31.0"
 sscanf = "*"
 rusttype = { version = "*", features = ["gpu_cache"] }
+image = "*"
+rodio = "*"

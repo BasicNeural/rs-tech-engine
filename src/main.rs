@@ -4,16 +4,28 @@ extern crate glium;
 #[path = "./geometry/consts/cube.rs"]
 mod cube;
 
+#[path = "./geometry/consts/plane.rs"]
+pub mod plane;
+
 #[path = "./geometry/object.rs"]
 mod object;
 
+use plane::get_plane;
+
 use glium::*;
+use glutin::event::VirtualKeyCode;
 use rusttype::gpu_cache::Cache;
 use rusttype::{point, vector, Font, PositionedGlyph, Rect, Scale};
 use std::borrow::Cow;
 use object::Vertex;
 use object::Object;
+use std::io::BufReader;
 use std::collections::LinkedList;
+use std::fs::File;
+use std::io::{self, BufRead};
+use std::path::Path;
+use rodio;
+use rodio::{Decoder, source::Source};
 
 
 fn main() {
@@ -23,42 +35,19 @@ fn main() {
     let font_data = std::include_bytes!("resources/Ubuntu-R.ttf");
     let font = Font::try_from_bytes(font_data as &[u8]).expect("err");
 
-
     let event_loop = glutin::event_loop::EventLoop::new();
-    let wb = glutin::window::WindowBuilder::new();
-    let cb = glutin::ContextBuilder::new().with_depth_buffer(24).with_multisampling(8);
+    let wb = glutin::window::WindowBuilder::new().with_inner_size(glium::glutin::dpi::LogicalSize::new(1280, 720));
+    let cb = glutin::ContextBuilder::new().with_depth_buffer(24).with_multisampling(4);
     let display = glium::Display::new(wb, cb, &event_loop).unwrap();
+
+    let (_stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
+
+    // let file = std::fs::File::open("./src/resources/examples_music.wav").unwrap();
+    // let beep1 = stream_handle.play_once(BufReader::new(file)).unwrap();
     
-    let mut cube = object::load_obj("./src/resources/cube.obj".to_string());
-    let mut teapot = object::load_obj("./src/resources/teapot.obj".to_string());
-    let mut sphere = object::load_obj("./src/resources/sphere.obj".to_string());
-
-    cube.model = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [5.0, 1.0, 0.0, 1.0f32]
-    ];
-
-    sphere.model = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [-5.0, 1.0, 0.0, 1.0f32]
-    ];
-
-    teapot.model = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [5.0, 0.0, 5.0, 1.0f32]
-    ];
-
-    let mut objects: LinkedList<Object> = LinkedList::new();
-
-    objects.push_back(teapot);
-    objects.push_back(cube);
-    objects.push_back(sphere);
+    let mut objects: LinkedList<Object> = load_objects("./src/resources/world1.scene".to_string());
+    let mut plane: Object = get_plane();
+    objects.push_back(plane);
 
     let scale = display.gl_window().window().scale_factor();
 
@@ -96,14 +85,11 @@ fn main() {
 
     let fragment_shader_src = r#"
         #version 150
-        in vec3 v_normal;
+
         out vec4 color;
-        uniform vec3 u_light;
+        uniform vec3 v_color;
         void main() {
-            float brightness = dot(normalize(v_normal), normalize(u_light));
-            vec3 dark_color = vec3(0.6, 0.0, 0.0);
-            vec3 regular_color = vec3(1.0, 0.0, 0.0);
-            color = vec4(mix(dark_color, regular_color, brightness), 1.0);
+            color = vec4(v_color, 1.0);
         }
     "#;
 
@@ -134,8 +120,8 @@ fn main() {
             color = vec4(0.0, 1.0, 0.0, 1.0);
         }
     "#;
-    let speed: f32 = 0.04;
-    let rotate_speed: f32 = 0.05;
+    let speed: f32 = 0.2;
+    let rotate_speed: f32 = 0.07;
     const PI: f32 = std::f32::consts::PI;
 
     let axis = vec![
@@ -157,7 +143,7 @@ fn main() {
 
     let mut x: f32 = 0.0;
     let mut y: f32 = 1.0;
-    let mut z: f32 = -5.0;
+    let mut z: f32 = -2.0;
     let mut c_angle: f32 = 0.0;
     let mut a_angle: f32 = 0.0;
     let mut w: bool = false;
@@ -170,6 +156,7 @@ fn main() {
     let mut down: bool = false;
     let mut lshift: bool = false;
     let mut space: bool = false;
+    let mut bounding_box_mode: bool = false;
 
     let text_program = glium::Program::from_source(&display, "
         #version 140
@@ -200,15 +187,11 @@ fn main() {
     let bounding_box_program = glium::Program::from_source(&display, vertex_shader_axis, fragment_shader_bounding_box,
                                               None).unwrap();
 
-    let mut prev_frame_time = std::time::Instant::now();
+    let mut prev_time = std::time::Instant::now();
 
     event_loop.run(move |event, _, control_flow| {
-        let cur_frame_time = std::time::Instant::now();
-        let frame_diff = cur_frame_time - prev_frame_time;
-        prev_frame_time = cur_frame_time;
-        let next_frame_time = std::time::Instant::now() +
-            std::time::Duration::from_nanos(16_666_667);
-        *control_flow = glutin::event_loop::ControlFlow::WaitUntil(next_frame_time);
+        let start_time = std::time::Instant::now();
+        let wait = (start_time - prev_time).as_millis();
 
         match event {
             glutin::event::Event::WindowEvent { event, .. } => match event {
@@ -219,31 +202,38 @@ fn main() {
                 glutin::event::WindowEvent::KeyboardInput { input, .. } => {
                     if let glutin::event::ElementState::Pressed = input.state {
                         match input.virtual_keycode {
-                            Some(glutin::event::VirtualKeyCode::Q) => *control_flow = glutin::event_loop::ControlFlow::Exit,
-                            Some(glutin::event::VirtualKeyCode::W) => w = true,
-                            Some(glutin::event::VirtualKeyCode::A) => a = true,
-                            Some(glutin::event::VirtualKeyCode::S) => s = true,
-                            Some(glutin::event::VirtualKeyCode::D) => d = true,
-                            Some(glutin::event::VirtualKeyCode::Right) => right = true,
-                            Some(glutin::event::VirtualKeyCode::Left) => left = true,
-                            Some(glutin::event::VirtualKeyCode::Up) => up = true,
-                            Some(glutin::event::VirtualKeyCode::Down) => down = true,
-                            Some(glutin::event::VirtualKeyCode::Space) => space = true,
-                            Some(glutin::event::VirtualKeyCode::LShift) => lshift = true,
+                            Some(VirtualKeyCode::Q) => *control_flow = glutin::event_loop::ControlFlow::Exit,
+                            Some(VirtualKeyCode::W) => w = true,
+                            Some(VirtualKeyCode::A) => a = true,
+                            Some(VirtualKeyCode::S) => s = true,
+                            Some(VirtualKeyCode::D) => d = true,
+                            Some(VirtualKeyCode::Right) => right = true,
+                            Some(VirtualKeyCode::Left) => left = true,
+                            Some(VirtualKeyCode::Up) => up = true,
+                            Some(VirtualKeyCode::Down) => down = true,
+                            Some(VirtualKeyCode::Space) => space = true,
+                            Some(VirtualKeyCode::LShift) => lshift = true,
+                            Some(VirtualKeyCode::F) => bounding_box_mode = !bounding_box_mode,
+                            Some(VirtualKeyCode::E) => {
+                                let beep_file = BufReader::new(std::fs::File::open("./src/resources/test.wav").unwrap());
+                                let source = Decoder::new(beep_file).unwrap();
+                                let sample = source.convert_samples();
+                                stream_handle.play_raw(sample).unwrap();
+                            },
                             _ => ()
                         }
                     } else if let glutin::event::ElementState::Released = input.state {
                         match input.virtual_keycode {
-                            Some(glutin::event::VirtualKeyCode::W) => w = false,
-                            Some(glutin::event::VirtualKeyCode::A) => a = false,
-                            Some(glutin::event::VirtualKeyCode::S) => s = false,
-                            Some(glutin::event::VirtualKeyCode::D) => d = false,
-                            Some(glutin::event::VirtualKeyCode::Right) => right = false,
-                            Some(glutin::event::VirtualKeyCode::Left) => left = false,
-                            Some(glutin::event::VirtualKeyCode::Up) => up = false,
-                            Some(glutin::event::VirtualKeyCode::Down) => down = false,
-                            Some(glutin::event::VirtualKeyCode::Space) => space = false,
-                            Some(glutin::event::VirtualKeyCode::LShift) => lshift = false,
+                            Some(VirtualKeyCode::W) => w = false,
+                            Some(VirtualKeyCode::A) => a = false,
+                            Some(VirtualKeyCode::S) => s = false,
+                            Some(VirtualKeyCode::D) => d = false,
+                            Some(VirtualKeyCode::Right) => right = false,
+                            Some(VirtualKeyCode::Left) => left = false,
+                            Some(VirtualKeyCode::Up) => up = false,
+                            Some(VirtualKeyCode::Down) => down = false,
+                            Some(VirtualKeyCode::Space) => space = false,
+                            Some(VirtualKeyCode::LShift) => lshift = false,
                             _ => ()
                         }
                     }
@@ -257,32 +247,32 @@ fn main() {
             },
             _ => return,
         }
-
+        
         let mut target = display.draw();
         target.clear_color_and_depth((0.0, 0.0, 0.0, 1.0), 1.0);
 
         if w {
-            z += speed * c_angle.cos();
-            x += speed * c_angle.sin();
+            z += speed * c_angle.cos() * (wait as f32 / 50.0);
+            x += speed * c_angle.sin() * (wait as f32 / 50.0);
         }
         if a {
-            x -= speed * c_angle.cos();
-            z += speed * c_angle.sin();
+            x -= speed * c_angle.cos() * (wait as f32 / 50.0);
+            z += speed * c_angle.sin() * (wait as f32 / 50.0);
         }
         if s {
-            z -= speed * c_angle.cos();
-            x -= speed * c_angle.sin();
+            z -= speed * c_angle.cos() * (wait as f32 / 50.0);
+            x -= speed * c_angle.sin() * (wait as f32 / 50.0);
         }
         if d {
-            x += speed * c_angle.cos();
-            z -= speed * c_angle.sin();
+            x += speed * c_angle.cos() * (wait as f32 / 50.0);
+            z -= speed * c_angle.sin() * (wait as f32 / 50.0);
         }
 
         if right {
-            c_angle += rotate_speed;
+            c_angle += rotate_speed * (wait as f32 / 50.0);
         }
         if left {
-            c_angle -= rotate_speed;
+            c_angle -= rotate_speed * (wait as f32 / 50.0);
         }
 
         if up && a_angle < PI {
@@ -350,7 +340,7 @@ fn main() {
                 write: true,
                 .. Default::default()
             },
-            //backface_culling: glium::draw_parameters::BackfaceCullingMode::CullClockwise,
+            // backface_culling: glium::draw_parameters::BackfaceCullingMode::CullClockwise,
             .. Default::default()
         };
 
@@ -366,37 +356,39 @@ fn main() {
         let axis_indices = glium::index::NoIndices(glium::index::PrimitiveType::LinesList);
 
         target.draw(&axis_vertex_buffer, &axis_indices, &axis_program,
-                    &uniform! { model: axis_model, view: view, perspective: perspective, u_light: light },
+                    &uniform! { model: axis_model, view: view, perspective: perspective },
                     &params).unwrap();
 
         let mut draw_count = 0;
 
         for object in objects.iter() {
-            let positions = glium::VertexBuffer::new(&display, &object.vertices).unwrap();
-            let normals = glium::VertexBuffer::new(&display, &object.normals).unwrap();
-            let indices = glium::IndexBuffer::new(&display, glium::index::PrimitiveType::TrianglesList,
-                                          &object.indices).unwrap();
-            let bounding_box_positions = glium::VertexBuffer::new(&display, &object.bounding_box_vertices).unwrap();
-            let bounding_box_indices = glium::IndexBuffer::new(&display, glium::index::PrimitiveType::LinesList,
-                &object.bounding_box_indices).unwrap();
+            if is_draw(&frustums, object) {
 
-            if is_draw(&frustums, &object) {
+                let positions = glium::VertexBuffer::new(&display, &object.vertices).unwrap();
+                let normals = glium::VertexBuffer::new(&display, &object.normals).unwrap();
+                let indices = glium::IndexBuffer::new(&display, glium::index::PrimitiveType::TrianglesList,
+                                                      &object.indices).unwrap();
+                let bounding_box_positions = glium::VertexBuffer::new(&display, &object.bounding_box_vertices).unwrap();
+                let bounding_box_indices = glium::IndexBuffer::new(&display, glium::index::PrimitiveType::LinesList,
+                                                                   &object.bounding_box_indices).unwrap();
+
                 draw_count += 1;
                 target.draw((&positions, &normals), &indices, &program,
-                    &uniform! { model: object.model, view: view, perspective: perspective, u_light: light },
+                    &uniform! { model: object.model, view: view, perspective: perspective, u_light: light, v_color: object.color },
                     &params).unwrap();
+                if bounding_box_mode {
+                    target.draw(&bounding_box_positions, &bounding_box_indices, &bounding_box_program,
+                        &uniform! { model: object.model, view: view, perspective: perspective, u_light: light },
+                        &params).unwrap();
+                }
             }
-            
-            target.draw(&bounding_box_positions, &bounding_box_indices, &bounding_box_program,
-                    &uniform! { model: object.model, view: view, perspective: perspective, u_light: light },
-                    &params).unwrap();
         }
 
         let fps = {
-            if frame_diff.as_millis() == 0 {
+            if wait == 0 {
                 0
             } else {
-                1000 / frame_diff.as_millis()
+                1000 / wait
             }
         };
 
@@ -507,6 +499,29 @@ fn main() {
             },
         ).unwrap();
         target.finish().unwrap();
+
+        match *control_flow {
+            glutin::event_loop::ControlFlow::Exit => (),
+            _ => {
+                /*
+                 * Grab window handle from the display (untested - based on API)
+                 */
+                // display.gl_window().window().request_redraw();
+                /*
+                 * Below logic to attempt hitting TARGET_FPS.
+                 * Basically, sleep for the rest of our milliseconds
+                 */
+                // let elapsed_time = std::time::Instant::now().duration_since(start_time).as_nanos() as u64;
+                // let wait_nanos = match 16_666_667 >= elapsed_time {
+                //     true => 16_666_667 - elapsed_time,
+                //     false => 0
+                // };
+                
+                let new_inst = start_time + std::time::Duration::from_nanos(16_666_667);
+                prev_time = start_time;
+                *control_flow = glutin::event_loop::ControlFlow::WaitUntil(new_inst);
+            }
+        }
     });
 }
 
@@ -630,4 +645,34 @@ fn mat_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     }
 
     c
+}
+
+pub fn load_objects(path: String) -> LinkedList<Object> {
+    let mut objects = LinkedList::new();
+    if let Ok(lines) = read_lines(path) {
+        for line in lines {
+            if let Ok(data) = line {
+                if data.contains("obj ") {
+                    if let Some((src, r, g, b, a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33)) = sscanf::scanf!(data, "obj {} {} {} {}  {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}", String, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) {
+                        let mut obj = object::Object::new(src);
+                        obj.color = [r, g, b];
+                        obj.model = [
+                            [a00, a01, a02, a03],
+                            [a10, a11, a12, a13],
+                            [a20, a21, a22, a23],
+                            [a30, a31, a32, a33]
+                        ];
+                        objects.push_back(obj);
+                    }
+                }
+            }
+        }
+    }
+    objects
+}
+
+fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
+where P: AsRef<Path>, {
+    let file = File::open(filename)?;
+    Ok(io::BufReader::new(file).lines())
 }

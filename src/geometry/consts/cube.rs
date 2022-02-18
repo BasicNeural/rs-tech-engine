@@ -43,6 +43,7 @@ pub fn get_cube() -> Object {
         ].to_vec(),
         bounding_box_vertices: [].to_vec(),
         bounding_box_indices: [].to_vec(),
+        color: [1.0, 1.0, 1.0f32],
         model: [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
